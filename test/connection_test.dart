@@ -591,16 +591,19 @@ void main() {
           try {
             // The connection should be detected as dead purely by keepalive
             // probes — no query needed. idle(2s) + interval(2s) * count(3) = 8s.
+            // Poll conn.isOpen which reflects _isClosing (set synchronously
+            // when the socket error handler fires). This avoids depending on
+            // socket.done which may not complete on some platforms.
             final sw = Stopwatch()..start();
-            await expectLater(
-              conn.closed.timeout(Duration(seconds: 45)),
-              completes,
-            );
+            while (conn.isOpen && sw.elapsed < Duration(seconds: 45)) {
+              await Future.delayed(Duration(milliseconds: 500));
+            }
             sw.stop();
 
+            expect(conn.isOpen, isFalse,
+                reason: 'Keepalive should detect dead peer within 45s');
             // Verify keepalive actually fired (not an immediate error).
             expect(sw.elapsed.inSeconds, greaterThanOrEqualTo(4));
-            expect(conn.isOpen, isFalse);
           } finally {
             // Flush iptables rules so the container is usable for teardown.
             await server.exec(['iptables', '-F']);

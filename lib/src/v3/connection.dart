@@ -610,6 +610,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     }
   }
 
+
   @override
   Future<void> get closed => _channel.sink.done;
 
@@ -721,11 +722,20 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
           });
         }
 
-        await Future.wait([_channel.sink.close(), _serverMessages.cancel()]);
-        _closeSession();
+        final cleanup =
+            Future.wait([_channel.sink.close(), _serverMessages.cancel()]);
+        // When the socket is broken, sink.close() may hang because socket.done
+        // never completes. Use a timeout to avoid blocking _closeSession().
+        if (_socketIsBroken) {
+          await cleanup.timeout(const Duration(seconds: 3));
+        } else {
+          await cleanup;
+        }
       } catch (err) {
         // error in _close(), silencing since the connection is no longer
         // usable anyway
+      } finally {
+        _closeSession();
       }
     }
   }
