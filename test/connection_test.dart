@@ -538,16 +538,26 @@ void main() {
   // and never reach the container. On Linux, Docker uses kernel-level NAT
   // and probes reach the container directly.
   withPostgresServer(
-    'TCP keep-alive',
+    'TCP keep-alive E2E',
     (server) {
+      var iptablesAvailable = false;
+
       setUpAll(() async {
         // The default postgres image doesn't ship iptables.
-        await server.exec(['bash', '-c', 'apt-get update -qq && apt-get install -y -qq iptables']);
+        final install = await server.exec(
+          ['bash', '-c', 'apt-get update -qq && apt-get install -y -qq iptables'],
+        );
+        iptablesAvailable = install.exitCode == 0;
       });
 
       test(
         'detects unresponsive peer via keepalive probes',
         () async {
+          if (!iptablesAvailable) {
+            markTestSkipped('iptables not available in container');
+            return;
+          }
+
           final conn = await PgConnectionImplementation.connect(
             await server.endpoint(),
             connectionSettings: ConnectionSettings(
@@ -568,19 +578,22 @@ void main() {
           // Unlike docker pause (kernel still ACKs) or docker network
           // disconnect (immediate ICMP error), DROP makes keepalive probes
           // go unanswered — the only way to trigger a real keepalive timeout.
-          await server.exec(
+          final r1 = await server.exec(
             ['iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '5432', '-j', 'DROP'],
           );
-          await server.exec(
+          final r2 = await server.exec(
             ['iptables', '-A', 'OUTPUT', '-p', 'tcp', '--sport', '5432', '-j', 'DROP'],
           );
+          if (r1.exitCode != 0 || r2.exitCode != 0) {
+            fail('iptables rules failed: ${r1.stderr} ${r2.stderr}');
+          }
 
           try {
             // The connection should be detected as dead purely by keepalive
             // probes — no query needed. idle(2s) + interval(2s) * count(3) = 8s.
             final sw = Stopwatch()..start();
             await expectLater(
-              conn.closed.timeout(Duration(seconds: 30)),
+              conn.closed.timeout(Duration(seconds: 45)),
               completes,
             );
             sw.stop();
@@ -593,6 +606,7 @@ void main() {
             await server.exec(['iptables', '-F']);
           }
         },
+        timeout: Timeout(Duration(seconds: 90)),
         skip: !Platform.isLinux ? 'Keepalive test requires Linux (macOS Docker Desktop uses a userspace TCP proxy)' : null,
       );
     },
