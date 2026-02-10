@@ -303,10 +303,10 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       timeout: settings.connectTimeout,
     );
 
-    // Enable TCP keep-alive if requested and not using a Unix-domain socket.
-    // Must be set before any SSL upgrade because SecureSocket does not expose
-    // setRawOption.
-    if (settings.keepAlive && !endpoint.isUnixSocket) {
+    // Enable TCP keep-alive unless disabled (Duration.zero) or using a
+    // Unix-domain socket. Must be set before any SSL upgrade because
+    // SecureSocket does not expose setRawOption.
+    if (settings.keepAliveInterval > Duration.zero && !endpoint.isUnixSocket) {
       _enableKeepAlive(socket, settings);
     }
 
@@ -415,38 +415,64 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     Socket socket,
     ResolvedConnectionSettings settings,
   ) {
-    final isLinux = Platform.isLinux || Platform.isAndroid;
+    final intervalSeconds = settings.keepAliveInterval.inSeconds;
+    final count = settings.keepAliveCount;
 
-    final soKeepAlive = isLinux ? 0x0009 : 0x0008;
+    // SO_KEEPALIVE: Linux/Android=0x0009, macOS/iOS/Windows=0x0008
+    final soKeepAlive =
+        Platform.isLinux || Platform.isAndroid ? 0x0009 : 0x0008;
     socket.setRawOption(
       RawSocketOption.fromBool(RawSocketOption.levelSocket, soKeepAlive, true),
     );
 
-    final idle = settings.keepAliveIdle?.inSeconds;
-    final interval = settings.keepAliveInterval?.inSeconds;
-    final count = settings.keepAliveCount;
+    if (Platform.isWindows) {
+      // Windows 10 1709+ supports TCP_KEEPIDLE(3), TCP_KEEPCNT(16),
+      // TCP_KEEPINTVL(17). Older versions only support SO_KEEPALIVE.
+      try {
+        socket.setRawOption(
+          RawSocketOption.fromInt(
+              RawSocketOption.levelTcp, 3, intervalSeconds),
+        );
+        socket.setRawOption(
+          RawSocketOption.fromInt(
+              RawSocketOption.levelTcp, 17, intervalSeconds),
+        );
+        socket.setRawOption(
+          RawSocketOption.fromInt(RawSocketOption.levelTcp, 16, count),
+        );
+      } on SocketException {
+        // Older Windows versions don't support fine-grained keepalive
+        // options. SO_KEEPALIVE is still enabled with OS defaults.
+      }
+    } else {
+      final isMac = Platform.isMacOS || Platform.isIOS;
 
-    if (idle != null) {
-      // TCP_KEEPIDLE (Linux=4) / TCP_KEEPALIVE (macOS=0x10, Windows=4)
-      final opt = Platform.isMacOS || Platform.isIOS ? 0x10 : 4;
+      // TCP_KEEPIDLE (Linux=4) / TCP_KEEPALIVE (macOS=0x10)
+      // Reuse the interval as the initial idle time.
       socket.setRawOption(
-        RawSocketOption.fromInt(RawSocketOption.levelTcp, opt, idle),
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x10 : 4,
+          intervalSeconds,
+        ),
       );
-    }
 
-    if (interval != null) {
-      // TCP_KEEPINTVL: Linux=5, macOS=0x101, Windows=5
-      final opt = Platform.isMacOS || Platform.isIOS ? 0x101 : 5;
+      // TCP_KEEPINTVL: Linux=5, macOS=0x101
       socket.setRawOption(
-        RawSocketOption.fromInt(RawSocketOption.levelTcp, opt, interval),
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x101 : 5,
+          intervalSeconds,
+        ),
       );
-    }
 
-    if (count != null) {
-      // TCP_KEEPCNT: Linux=6, macOS=0x102, Windows=6
-      final opt = Platform.isMacOS || Platform.isIOS ? 0x102 : 6;
+      // TCP_KEEPCNT: Linux=6, macOS=0x102
       socket.setRawOption(
-        RawSocketOption.fromInt(RawSocketOption.levelTcp, opt, count),
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x102 : 6,
+          count,
+        ),
       );
     }
   }

@@ -12,31 +12,39 @@ on:
     branches: [ master ]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  analyze:
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v3
 
-      # Note: This workflow uses the latest stable version of the Dart SDK.
-      # You can specify other versions if desired, see documentation here:
-      # https://github.com/dart-lang/setup-dart/blob/main/README.md
-      # - uses: dart-lang/setup-dart@v1
       - uses: dart-lang/setup-dart@9a04e6d73cca37bd455e0608d7e5092f881fd603
 
       - name: Install dependencies
         run: dart pub get
 
-      # Uncomment this step to verify the use of 'dart format' on each commit.
-      # - name: Verify formatting
-      #   run: dart format --output=none --set-exit-if-changed .
-
-      # Consider passing '--fatal-infos' for slightly stricter analysis.
       - name: Analyze project source
         run: dart analyze
 
-      # pre-pull the image so `usePostgresDocker` does not delay which may causes 
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: analyze
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dart-lang/setup-dart@9a04e6d73cca37bd455e0608d7e5092f881fd603
+
+      - name: Install dependencies
+        run: dart pub get
+
+      # pre-pull the image so `usePostgresDocker` does not delay which may causes
       # tests to timeout
       - name: pull latest postgres image
         run: docker pull postgres:latest
@@ -60,3 +68,54 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v3
+
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    needs: analyze
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dart-lang/setup-dart@9a04e6d73cca37bd455e0608d7e5092f881fd603
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Setup PostgreSQL 17
+        run: |
+          brew install postgresql@17
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          echo "$(brew --prefix postgresql@17)/bin" >> $GITHUB_PATH
+          brew services start postgresql@17
+          sleep 3
+          createuser -s user
+
+      - name: Smoke test
+        run: dart run example/example.dart
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    needs: analyze
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dart-lang/setup-dart@9a04e6d73cca37bd455e0608d7e5092f881fd603
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Setup PostgreSQL 17
+        shell: pwsh
+        run: |
+          choco install postgresql -y --params '/Password:pass'
+          $pgBin = (Resolve-Path "C:\Program Files\PostgreSQL\*\bin").Path
+          echo $pgBin >> $env:GITHUB_PATH
+          $env:PATH = "$pgBin;" + $env:PATH
+          $env:PGPASSWORD = "pass"
+          & psql -U postgres -c "CREATE USER `"user`" WITH PASSWORD 'pass' SUPERUSER CREATEDB;"
+
+      - name: Smoke test
+        run: dart run example/example.dart

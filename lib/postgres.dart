@@ -534,8 +534,6 @@ class ConnectionSettings extends SessionSettings {
     super.queryTimeout,
     super.queryMode,
     super.ignoreSuperfluousParameters,
-    super.keepAlive,
-    super.keepAliveIdle,
     super.keepAliveInterval,
     super.keepAliveCount,
   });
@@ -561,28 +559,22 @@ class SessionSettings {
   /// parameters are found.
   final bool? ignoreSuperfluousParameters;
 
-  /// Whether to enable TCP keep-alive on the socket connection.
+  /// Interval between TCP keep-alive probes. Also used as the initial idle
+  /// time before the first probe is sent (`TCP_KEEPIDLE` / `TCP_KEEPINTVL`).
   ///
-  /// When enabled, sets `SO_KEEPALIVE` on the underlying TCP socket so that
-  /// the operating system will periodically send probes on idle connections
-  /// to detect broken peers.
+  /// When non-zero, enables `SO_KEEPALIVE` on the underlying TCP socket so
+  /// that the operating system will periodically send probes on idle
+  /// connections to detect broken peers.
   ///
-  /// Defaults to `false`. Has no effect on Unix-domain socket connections.
-  final bool? keepAlive;
-
-  /// Time a connection must be idle before the first keep-alive probe is sent.
-  /// Sets `TCP_KEEPIDLE` (Linux) / `TCP_KEEPALIVE` (macOS) per-socket.
-  /// Requires [keepAlive] to be `true`. Falls back to OS default if null.
-  final Duration? keepAliveIdle;
-
-  /// Interval between successive keep-alive probes when no acknowledgement
-  /// is received. Sets `TCP_KEEPINTVL` per-socket.
-  /// Requires [keepAlive] to be `true`. Falls back to OS default if null.
+  /// Set to [Duration.zero] to disable keep-alive.
+  /// Defaults to 30 seconds. Has no effect on Unix-domain socket connections.
   final Duration? keepAliveInterval;
 
-  /// Number of unacknowledged probes before the connection is considered dead.
-  /// Sets `TCP_KEEPCNT` per-socket.
-  /// Requires [keepAlive] to be `true`. Falls back to OS default if null.
+  /// Number of unacknowledged keep-alive probes before the connection is
+  /// considered dead. Sets `TCP_KEEPCNT` per-socket.
+  ///
+  /// Only effective when [keepAliveInterval] is non-zero.
+  /// Defaults to 5.
   final int? keepAliveCount;
 
   const SessionSettings({
@@ -590,8 +582,6 @@ class SessionSettings {
     this.queryTimeout,
     this.queryMode,
     this.ignoreSuperfluousParameters,
-    this.keepAlive,
-    this.keepAliveIdle,
     this.keepAliveInterval,
     this.keepAliveCount,
   });
