@@ -303,6 +303,13 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       timeout: settings.connectTimeout,
     );
 
+    // Enable TCP keep-alive unless disabled (Duration.zero) or using a
+    // Unix-domain socket. Must be set before any SSL upgrade because
+    // SecureSocket does not expose setRawOption.
+    if (settings.keepAliveInterval > Duration.zero && !endpoint.isUnixSocket) {
+      _enableKeepAlive(socket, settings);
+    }
+
     final sslCompleter = Completer<int>();
     // ignore: cancel_subscriptions
     final subscription = socket.listen(
@@ -402,6 +409,72 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       ).transform(messageTransformer(codecContext)),
       secure,
     );
+  }
+
+  static void _enableKeepAlive(
+    Socket socket,
+    ResolvedConnectionSettings settings,
+  ) {
+    final intervalSeconds = settings.keepAliveInterval.inSeconds;
+    final count = settings.keepAliveCount;
+
+    // SO_KEEPALIVE: Linux/Android=0x0009, macOS/iOS/Windows=0x0008
+    final soKeepAlive =
+        Platform.isLinux || Platform.isAndroid ? 0x0009 : 0x0008;
+    socket.setRawOption(
+      RawSocketOption.fromBool(RawSocketOption.levelSocket, soKeepAlive, true),
+    );
+
+    if (Platform.isWindows) {
+      // Windows 10 1709+ supports TCP_KEEPIDLE(3), TCP_KEEPCNT(16),
+      // TCP_KEEPINTVL(17). Older versions only support SO_KEEPALIVE.
+      try {
+        socket.setRawOption(
+          RawSocketOption.fromInt(
+              RawSocketOption.levelTcp, 3, intervalSeconds),
+        );
+        socket.setRawOption(
+          RawSocketOption.fromInt(
+              RawSocketOption.levelTcp, 17, intervalSeconds),
+        );
+        socket.setRawOption(
+          RawSocketOption.fromInt(RawSocketOption.levelTcp, 16, count),
+        );
+      } on SocketException {
+        // Older Windows versions don't support fine-grained keepalive
+        // options. SO_KEEPALIVE is still enabled with OS defaults.
+      }
+    } else {
+      final isMac = Platform.isMacOS || Platform.isIOS;
+
+      // TCP_KEEPIDLE (Linux=4) / TCP_KEEPALIVE (macOS=0x10)
+      // Reuse the interval as the initial idle time.
+      socket.setRawOption(
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x10 : 4,
+          intervalSeconds,
+        ),
+      );
+
+      // TCP_KEEPINTVL: Linux=5, macOS=0x101
+      socket.setRawOption(
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x101 : 5,
+          intervalSeconds,
+        ),
+      );
+
+      // TCP_KEEPCNT: Linux=6, macOS=0x102
+      socket.setRawOption(
+        RawSocketOption.fromInt(
+          RawSocketOption.levelTcp,
+          isMac ? 0x102 : 6,
+          count,
+        ),
+      );
+    }
   }
 
   final Endpoint _endpoint;
@@ -537,6 +610,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     }
   }
 
+
   @override
   Future<void> get closed => _channel.sink.done;
 
@@ -648,11 +722,20 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
           });
         }
 
-        await Future.wait([_channel.sink.close(), _serverMessages.cancel()]);
-        _closeSession();
+        final cleanup =
+            Future.wait([_channel.sink.close(), _serverMessages.cancel()]);
+        // When the socket is broken, sink.close() may hang because socket.done
+        // never completes. Use a timeout to avoid blocking _closeSession().
+        if (_socketIsBroken) {
+          await cleanup.timeout(const Duration(seconds: 3));
+        } else {
+          await cleanup;
+        }
       } catch (err) {
         // error in _close(), silencing since the connection is no longer
         // usable anyway
+      } finally {
+        _closeSession();
       }
     }
   }

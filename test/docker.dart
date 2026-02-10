@@ -85,6 +85,14 @@ class PostgresServer {
   Future<void> kill() async {
     await Process.run('docker', ['kill', await _containerName.future]);
   }
+
+  /// Runs a command inside the container via `docker exec`.
+  Future<ProcessResult> exec(List<String> args) async {
+    return Process.run(
+      'docker',
+      ['exec', await _containerName.future, ...args],
+    );
+  }
 }
 
 StreamTransformer<Uint8List, Uint8List> _transformIncomingBytes() {
@@ -119,6 +127,7 @@ void withPostgresServer(
   String? pgPassword,
   String? pgHbaConfContent,
   String? timeZone,
+  List<String>? dockerArgs,
 }) {
   group(name, () {
     final server = PostgresServer(pgUser: pgUser, pgPassword: pgPassword);
@@ -145,6 +154,7 @@ void withPostgresServer(
           pgPassword: pgPassword,
           pgHbaConfPath: pgHbaConfPath,
           timeZone: timeZone,
+          extraDockerArgs: dockerArgs,
         );
 
         server._containerName.complete(containerName);
@@ -182,6 +192,7 @@ Future<void> _startPostgresContainer({
   String? pgPassword,
   String? pgHbaConfPath,
   String? timeZone,
+  List<String>? extraDockerArgs,
 }) async {
   final isRunning = await _isPostgresContainerRunning(containerName);
   if (isRunning) {
@@ -189,25 +200,44 @@ Future<void> _startPostgresContainer({
   }
 
   final configPath = p.join(Directory.current.path, 'test', 'pg_configs');
+  final pgHba = pgHbaConfPath ?? p.join(configPath, 'pg_hba.conf');
+  final pgConf = p.join(configPath, 'postgresql.conf');
 
-  final dp = await startPostgres(
+  final dockerArgs = <String>[
+    '-v', '$pgConf:/etc/postgresql/postgresql.conf',
+    '-v', '$pgHba:/etc/postgresql/pg_hba.conf',
+    if (extraDockerArgs != null) ...extraDockerArgs,
+  ];
+
+  final imageArgs = <String>[
+    '-c', 'config_file=/etc/postgresql/postgresql.conf',
+    '-c', 'hba_file=/etc/postgresql/pg_hba.conf',
+    '-c', 'ssl=on',
+    '-c', 'ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem',
+    '-c', 'ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key',
+  ];
+
+  var ipv4 = false;
+  final dp = await DockerProcess.start(
     name: containerName,
-    version: 'latest',
-    pgPort: port,
-    pgDatabase: 'postgres',
-    pgUser: pgUser ?? 'postgres',
-    pgPassword: pgPassword ?? 'postgres',
+    image: 'postgres:latest',
+    dockerArgs: dockerArgs,
+    imageArgs: imageArgs,
+    hostname: containerName,
+    ports: ['$port:5432'],
     cleanup: true,
-    configurations: [
-      // SSL settings
-      'ssl=on',
-      // The debian image includes a self-signed SSL cert that can be used:
-      'ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem',
-      'ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key',
-    ],
-    pgHbaConfPath: pgHbaConfPath ?? p.join(configPath, 'pg_hba.conf'),
-    postgresqlConfPath: p.join(configPath, 'postgresql.conf'),
-    timeZone: timeZone,
+    environment: {
+      'POSTGRES_USER': pgUser ?? 'postgres',
+      'POSTGRES_PASSWORD': pgPassword ?? 'postgres',
+      'POSTGRES_DB': 'postgres',
+      if (timeZone != null) 'TZ': timeZone,
+      if (timeZone != null) 'PGTZ': timeZone,
+    },
+    readySignal: (line) {
+      ipv4 |= line.contains('listening on IPv4 address "0.0.0.0", port 5432');
+      return ipv4 &&
+          line.contains('database system is ready to accept connections');
+    },
   );
 
   // Setup the database to support all kind of tests

@@ -2,8 +2,10 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:postgres/postgres.dart';
+import 'package:postgres/src/v3/connection.dart';
 import 'package:test/test.dart';
 
 import 'docker.dart';
@@ -454,4 +456,163 @@ void main() {
       }
     });
   });
+
+  // Cross-platform test: verifies that the platform-specific socket option
+  // constants (SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT) are
+  // accepted by the OS and the values stick. No Docker or PG needed.
+  group('TCP keep-alive socket options', () {
+    test('sets and reads back keepalive options on all platforms', () async {
+      final serverSocket = await ServerSocket.bind('localhost', 0);
+      final rawSocket = await RawSocket.connect('localhost', serverSocket.port);
+
+      try {
+        final isMac = Platform.isMacOS || Platform.isIOS;
+        final isWindows = Platform.isWindows;
+        final isLinux = Platform.isLinux || Platform.isAndroid;
+
+        // SO_KEEPALIVE
+        final soKeepAlive = isLinux ? 0x0009 : 0x0008;
+        rawSocket.setRawOption(
+          RawSocketOption.fromBool(
+              RawSocketOption.levelSocket, soKeepAlive, true),
+        );
+        final kaVal = rawSocket.getRawOption(
+          RawSocketOption(RawSocketOption.levelSocket, soKeepAlive, Uint8List(4)),
+        );
+        expect(
+          ByteData.sublistView(kaVal).getInt32(0, Endian.host),
+          isNonZero,
+          reason: 'SO_KEEPALIVE should be enabled',
+        );
+
+        // TCP_KEEPIDLE: Linux=4, macOS=0x10, Windows=3
+        final idleOpt = isMac ? 0x10 : isWindows ? 3 : 4;
+        rawSocket.setRawOption(
+          RawSocketOption.fromInt(RawSocketOption.levelTcp, idleOpt, 42),
+        );
+        final idleVal = rawSocket.getRawOption(
+          RawSocketOption(RawSocketOption.levelTcp, idleOpt, Uint8List(4)),
+        );
+        expect(
+          ByteData.sublistView(idleVal).getInt32(0, Endian.host),
+          42,
+          reason: 'TCP_KEEPIDLE should be 42',
+        );
+
+        // TCP_KEEPINTVL: Linux=5, macOS=0x101, Windows=17
+        final intvlOpt = isMac ? 0x101 : isWindows ? 17 : 5;
+        rawSocket.setRawOption(
+          RawSocketOption.fromInt(RawSocketOption.levelTcp, intvlOpt, 42),
+        );
+        final intvlVal = rawSocket.getRawOption(
+          RawSocketOption(RawSocketOption.levelTcp, intvlOpt, Uint8List(4)),
+        );
+        expect(
+          ByteData.sublistView(intvlVal).getInt32(0, Endian.host),
+          42,
+          reason: 'TCP_KEEPINTVL should be 42',
+        );
+
+        // TCP_KEEPCNT: Linux=6, macOS=0x102, Windows=16
+        final cntOpt = isMac ? 0x102 : isWindows ? 16 : 6;
+        rawSocket.setRawOption(
+          RawSocketOption.fromInt(RawSocketOption.levelTcp, cntOpt, 7),
+        );
+        final cntVal = rawSocket.getRawOption(
+          RawSocketOption(RawSocketOption.levelTcp, cntOpt, Uint8List(4)),
+        );
+        expect(
+          ByteData.sublistView(cntVal).getInt32(0, Endian.host),
+          7,
+          reason: 'TCP_KEEPCNT should be 7',
+        );
+      } finally {
+        rawSocket.close();
+        await serverSocket.close();
+      }
+    });
+  });
+
+  // E2E test requires Linux — on macOS Docker Desktop, a userspace TCP proxy
+  // sits between host and container, so keepalive probes are ACK'd locally
+  // and never reach the container. On Linux, Docker uses kernel-level NAT
+  // and probes reach the container directly.
+  withPostgresServer(
+    'TCP keep-alive E2E',
+    (server) {
+      var iptablesAvailable = false;
+
+      setUpAll(() async {
+        // The default postgres image doesn't ship iptables.
+        final install = await server.exec(
+          ['bash', '-c', 'apt-get update -qq && apt-get install -y -qq iptables'],
+        );
+        iptablesAvailable = install.exitCode == 0;
+      });
+
+      test(
+        'detects unresponsive peer via keepalive probes',
+        () async {
+          if (!iptablesAvailable) {
+            markTestSkipped('iptables not available in container');
+            return;
+          }
+
+          final conn = await PgConnectionImplementation.connect(
+            await server.endpoint(),
+            connectionSettings: ConnectionSettings(
+              connectTimeout: Duration(seconds: 5),
+              queryTimeout: Duration(seconds: 5),
+              sslMode: SslMode.disable,
+              // Aggressive keepalive: 2s idle, 2s interval, 3 probes → ~8s.
+              keepAliveInterval: Duration(seconds: 2),
+              keepAliveCount: 3,
+            ),
+          );
+
+          // Verify connection works before black-holing traffic.
+          final rs = await conn.execute('SELECT 1');
+          expect(rs.first.first, 1);
+
+          // Use iptables to silently DROP all TCP traffic on port 5432.
+          // Unlike docker pause (kernel still ACKs) or docker network
+          // disconnect (immediate ICMP error), DROP makes keepalive probes
+          // go unanswered — the only way to trigger a real keepalive timeout.
+          final r1 = await server.exec(
+            ['iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '5432', '-j', 'DROP'],
+          );
+          final r2 = await server.exec(
+            ['iptables', '-A', 'OUTPUT', '-p', 'tcp', '--sport', '5432', '-j', 'DROP'],
+          );
+          if (r1.exitCode != 0 || r2.exitCode != 0) {
+            fail('iptables rules failed: ${r1.stderr} ${r2.stderr}');
+          }
+
+          try {
+            // The connection should be detected as dead purely by keepalive
+            // probes — no query needed. idle(2s) + interval(2s) * count(3) = 8s.
+            // Poll conn.isOpen which reflects _isClosing (set synchronously
+            // when the socket error handler fires). This avoids depending on
+            // socket.done which may not complete on some platforms.
+            final sw = Stopwatch()..start();
+            while (conn.isOpen && sw.elapsed < Duration(seconds: 45)) {
+              await Future.delayed(Duration(milliseconds: 500));
+            }
+            sw.stop();
+
+            expect(conn.isOpen, isFalse,
+                reason: 'Keepalive should detect dead peer within 45s');
+            // Verify keepalive actually fired (not an immediate error).
+            expect(sw.elapsed.inSeconds, greaterThanOrEqualTo(4));
+          } finally {
+            // Flush iptables rules so the container is usable for teardown.
+            await server.exec(['iptables', '-F']);
+          }
+        },
+        timeout: Timeout(Duration(seconds: 90)),
+        skip: !Platform.isLinux ? 'Keepalive test requires Linux (macOS Docker Desktop uses a userspace TCP proxy)' : null,
+      );
+    },
+    dockerArgs: ['--cap-add=NET_ADMIN'],
+  );
 }

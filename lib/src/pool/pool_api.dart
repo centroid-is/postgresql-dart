@@ -42,6 +42,8 @@ class PoolSettings extends ConnectionSettings {
     super.ignoreSuperfluousParameters,
     super.onOpen,
     super.typeRegistry,
+    super.keepAliveInterval,
+    super.keepAliveCount,
   });
 }
 

@@ -15,6 +15,10 @@ class ResolvedSessionSettings implements SessionSettings {
   final QueryMode queryMode;
   @override
   final bool ignoreSuperfluousParameters;
+  @override
+  final Duration keepAliveInterval;
+  @override
+  final int keepAliveCount;
 
   ResolvedSessionSettings(SessionSettings? settings, SessionSettings? fallback)
     : connectTimeout =
@@ -30,7 +34,12 @@ class ResolvedSessionSettings implements SessionSettings {
       ignoreSuperfluousParameters =
           settings?.ignoreSuperfluousParameters ??
           fallback?.ignoreSuperfluousParameters ??
-          false;
+          false,
+      keepAliveInterval =
+          settings?.keepAliveInterval ??
+          fallback?.keepAliveInterval ??
+          Duration(seconds: 30),
+      keepAliveCount = settings?.keepAliveCount ?? fallback?.keepAliveCount ?? 5;
 
   bool isMatchingSession(ResolvedSessionSettings other) {
     return connectTimeout == other.connectTimeout &&
