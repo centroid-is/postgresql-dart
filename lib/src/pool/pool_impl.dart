@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:collection/collection.dart';
 import 'package:pool/pool.dart' as pool;
@@ -15,6 +16,13 @@ EndpointSelector roundRobinSelector(List<Endpoint> endpoints) {
     nextIndex = (nextIndex + 1) % endpoints.length;
     return EndpointSelection(endpoint: endpoint);
   };
+}
+
+int _poolDiagSeq = 0;
+void _poolDiag(String msg) {
+  // Diagnostic branch only: tfc-hmi is chasing four Postgres backends per CI
+  // run that nothing on the Dart side admits to holding.
+  stderr.writeln('[pooldiag] $msg');
 }
 
 class PoolImplementation<L> implements Pool<L> {
@@ -38,6 +46,9 @@ class PoolImplementation<L> implements Pool<L> {
 
   @override
   Future<void> close({bool force = false}) async {
+    _poolDiag('close(force: $force) enter: '
+        '${_connections.length} tracked '
+        '${_connections.map((c) => '#${c._diagId}(inUse=${c._isInUse})').join(',')}');
     _closing = true;
     final semaphoreFuture = _semaphore.close();
 
@@ -50,6 +61,8 @@ class PoolImplementation<L> implements Pool<L> {
     }
 
     await semaphoreFuture;
+    _poolDiag('close(force: $force) done: ${_connections.length} still tracked '
+        '${_connections.map((c) => '#${c._diagId}').join(',')}');
   }
 
   @override
@@ -213,6 +226,8 @@ class PoolImplementation<L> implements Pool<L> {
             connectionSettings: settings,
           ),
         );
+        newc._diagId = ++_poolDiagSeq;
+        _poolDiag('opened #${newc._diagId}');
         newc._isInUse = true;
         // NOTE: It is important to update _connections list after the isInUse
         //       flag is set, otherwise race conditions may create conflicts or
@@ -226,6 +241,7 @@ class PoolImplementation<L> implements Pool<L> {
 
 /// An opened [Connection] we're able to use in [Pool.withConnection].
 class _PoolConnection implements Connection {
+  int _diagId = 0;
   final _opened = DateTime.now();
   final PoolImplementation _pool;
   final Endpoint _endpoint;
@@ -267,6 +283,7 @@ class _PoolConnection implements Connection {
   }
 
   Future<void> _dispose({bool force = false}) async {
+    _poolDiag('dispose #$_diagId (force=$force)');
     _pool._connections.remove(this);
     await _connection.close(force: force);
   }
