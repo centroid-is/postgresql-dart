@@ -24,6 +24,15 @@ import 'resolved_settings.dart';
 
 const _debugLog = false;
 
+/// Longest an orderly connection close may take before the socket is simply
+/// destroyed instead.
+///
+/// Generous for what it covers -- flushing a five byte Terminate and
+/// cancelling a subscription -- because exceeding it means giving up on the
+/// server being told, and a server that has to work out on its own that the
+/// peer is gone holds the connection slot for longer.
+const _closeTimeout = Duration(seconds: 3);
+
 String _identifier(String source) {
   // To avoid complex ambiguity rules, we always wrap identifier in double
   // quotes. That means the only character we need to escape are double quotes
@@ -235,7 +244,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       encoding: settings.encoding,
       typeRegistry: settings.typeRegistry,
     );
-    var (channel, secure) = await _connect(
+    var (channel, secure, rawSocket) = await _connect(
       endpoint,
       settings,
       codecContext: codecContext,
@@ -255,6 +264,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       secure,
       databaseInfo: codecContext.databaseInfo,
       info: codecContext.connectionInfo,
+      rawSocket: rawSocket,
     );
     // A connect that fails after the socket is up has to take the socket with
     // it. `_startup` bounds the authentication handshake with
@@ -306,7 +316,7 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     );
   }
 
-  static Future<(StreamChannel<Message>, bool)> _connect(
+  static Future<(StreamChannel<Message>, bool, Socket)> _connect(
     Endpoint endpoint,
     ResolvedConnectionSettings settings, {
     required CodecContext codecContext,
@@ -323,112 +333,133 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       timeout: settings.connectTimeout,
     );
 
-    // Enable TCP keep-alive unless disabled (Duration.zero) or using a
-    // Unix-domain socket. Must be set before any SSL upgrade because
-    // SecureSocket does not expose setRawOption.
-    if (settings.keepAliveInterval > Duration.zero && !endpoint.isUnixSocket) {
-      _enableKeepAlive(socket, settings);
-    }
+    // From here on the socket is connected but not yet owned by anything: the
+    // caller only ever sees it wrapped in the channel this returns, so if we
+    // throw without closing it first, nothing is left holding a reference and
+    // the socket stays open for the life of the process. Every failure below
+    // -- an SSL negotiation that times out, a server that turns out not to
+    // support SSL, a bad certificate -- used to leak one that way.
+    try {
+      // Enable TCP keep-alive unless disabled (Duration.zero) or using a
+      // Unix-domain socket. Must be set before any SSL upgrade because
+      // SecureSocket does not expose setRawOption.
+      if (settings.keepAliveInterval > Duration.zero &&
+          !endpoint.isUnixSocket) {
+        _enableKeepAlive(socket, settings);
+      }
 
-    final sslCompleter = Completer<int>();
-    // ignore: cancel_subscriptions
-    final subscription = socket.listen(
-      (data) {
-        if (sslCompleter.isCompleted) {
-          return;
-        }
-        if (data.length != 1) {
+      final sslCompleter = Completer<int>();
+      // ignore: cancel_subscriptions
+      final subscription = socket.listen(
+        (data) {
+          if (sslCompleter.isCompleted) {
+            return;
+          }
+          if (data.length != 1) {
+            sslCompleter.completeError(
+              PgException(
+                'Could not initialize SSL connection, received unknown byte stream.',
+              ),
+            );
+            return;
+          }
+
+          sslCompleter.complete(data.first);
+        },
+        onDone: () {
+          if (sslCompleter.isCompleted) {
+            return;
+          }
           sslCompleter.completeError(
             PgException(
-              'Could not initialize SSL connection, received unknown byte stream.',
+              'Could not initialize SSL connection, connection closed during handshake.',
             ),
           );
-          return;
-        }
-
-        sslCompleter.complete(data.first);
-      },
-      onDone: () {
-        if (sslCompleter.isCompleted) {
-          return;
-        }
-        sslCompleter.completeError(
-          PgException(
-            'Could not initialize SSL connection, connection closed during handshake.',
-          ),
-        );
-      },
-      onError: (e) {
-        if (sslCompleter.isCompleted) {
-          return;
-        }
-        sslCompleter.completeError(e);
-      },
-    );
-
-    Stream<Uint8List> adaptedStream;
-    var secure = false;
-
-    if (settings.sslMode != SslMode.disable) {
-      // Query if SSL is possible by sending a SSLRequest message
-      final byteBuffer = ByteData(8);
-      byteBuffer.setUint32(0, 8);
-      byteBuffer.setUint32(4, 80877103);
-      socket.add(byteBuffer.buffer.asUint8List());
-
-      final byte = await sslCompleter.future.timeout(settings.connectTimeout);
-
-      if (byte == $S) {
-        // SSL is supported, upgrade!
-        subscription.pause();
-
-        socket = await SecureSocket.secure(
-          socket,
-          context: settings.securityContext,
-          onBadCertificate: settings.sslMode.ignoreCertificateIssues
-              ? (_) => true
-              : (c) => throw BadCertificateException(c),
-        ).timeout(settings.connectTimeout);
-        secure = true;
-
-        // We can listen to the secured socket again, the existing subscription is
-        // ignored.
-        adaptedStream = socket;
-      } else {
-        // This server does not support SSL
-        throw PgException(
-          'Server does not support SSL, but it was required (default configuration). '
-          'To disable secure connections, use `ConnectionSettings(sslMode: SslMode.disable)`.',
-        );
-      }
-    } else {
-      // We've listened to the stream already and sockets are single-subscription
-      // streams. Expose it as a new stream.
-      adaptedStream = async.SubscriptionStream(subscription);
-    }
-
-    if (incomingBytesTransformer != null) {
-      adaptedStream = adaptedStream.transform(incomingBytesTransformer);
-    }
-
-    final outgoingSocket = async.StreamSinkExtensions(socket).transform<Uint8List>(
-      async.StreamSinkTransformer.fromHandlers(
-        handleDone: (out) {
-          // As per the stream channel's guarantees, closing the sink should close
-          // the channel in both directions.
-          socket.destroy();
-          return out.close();
         },
-      ),
-    );
+        onError: (e) {
+          if (sslCompleter.isCompleted) {
+            return;
+          }
+          sslCompleter.completeError(e);
+        },
+      );
 
-    return (
-      StreamChannel<List<int>>(
-        adaptedStream,
-        outgoingSocket,
-      ).transform(messageTransformer(codecContext)),
-      secure,
-    );
+      Stream<Uint8List> adaptedStream;
+      var secure = false;
+
+      if (settings.sslMode != SslMode.disable) {
+        // Query if SSL is possible by sending a SSLRequest message
+        final byteBuffer = ByteData(8);
+        byteBuffer.setUint32(0, 8);
+        byteBuffer.setUint32(4, 80877103);
+        socket.add(byteBuffer.buffer.asUint8List());
+
+        final byte =
+            await sslCompleter.future.timeout(settings.connectTimeout);
+
+        if (byte == $S) {
+          // SSL is supported, upgrade!
+          subscription.pause();
+
+          socket = await SecureSocket.secure(
+            socket,
+            context: settings.securityContext,
+            onBadCertificate: settings.sslMode.ignoreCertificateIssues
+                ? (_) => true
+                : (c) => throw BadCertificateException(c),
+          ).timeout(settings.connectTimeout);
+          secure = true;
+
+          // We can listen to the secured socket again, the existing subscription is
+          // ignored.
+          adaptedStream = socket;
+        } else {
+          // This server does not support SSL
+          throw PgException(
+            'Server does not support SSL, but it was required (default configuration). '
+            'To disable secure connections, use `ConnectionSettings(sslMode: SslMode.disable)`.',
+          );
+        }
+      } else {
+        // We've listened to the stream already and sockets are single-subscription
+        // streams. Expose it as a new stream.
+        adaptedStream = async.SubscriptionStream(subscription);
+      }
+
+      if (incomingBytesTransformer != null) {
+        adaptedStream = adaptedStream.transform(incomingBytesTransformer);
+      }
+
+      final outgoingSocket = async.StreamSinkExtensions(
+        socket,
+      ).transform<Uint8List>(
+        async.StreamSinkTransformer.fromHandlers(
+          handleDone: (out) {
+            // As per the stream channel's guarantees, closing the sink should close
+            // the channel in both directions.
+            socket.destroy();
+            return out.close();
+          },
+        ),
+      );
+
+      return (
+        StreamChannel<List<int>>(
+          adaptedStream,
+          outgoingSocket,
+        ).transform(messageTransformer(codecContext)),
+        secure,
+        socket,
+      );
+    } catch (_) {
+      // Best effort: an upgrade that failed part-way may have left either
+      // socket in a state where destroy() throws, and the original error is
+      // the one worth reporting.
+      try {
+        socket.destroy();
+      } catch (_) {}
+      rethrow;
+    }
   }
 
   static void _enableKeepAlive(
@@ -520,6 +551,17 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
   bool _isClosing = false;
   bool _socketIsBroken = false;
 
+  /// The socket underneath [_channel], kept so that a close can guarantee the
+  /// TCP session ends even when the orderly shutdown does not get that far.
+  ///
+  /// Null only for connections built in tests from a channel that has no
+  /// socket behind it.
+  final Socket? _rawSocket;
+
+  /// The close that is currently running, so that a second [close] waits for
+  /// it rather than reporting success while the first is still in flight.
+  Future<void>? _closeFuture;
+
   _PendingOperation? _pending;
   // Errors happening while a transaction is active will roll back the
   // transaction and should be reporte to the user.
@@ -547,7 +589,9 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     this._channelIsSecure, {
     required DatabaseInfo databaseInfo,
     required this.info,
-  }) : _databaseInfo = databaseInfo {
+    Socket? rawSocket,
+  }) : _databaseInfo = databaseInfo,
+       _rawSocket = rawSocket {
     _serverMessages = _channel.stream.listen(
       _handleMessage,
       onDone: _socketClosed,
@@ -726,37 +770,70 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     bool interruptRunning,
     PgException? cause, {
     bool socketIsBroken = false,
-  }) async {
+  }) {
     _socketIsBroken = _socketIsBroken || socketIsBroken;
-    if (!_isClosing) {
-      _isClosing = true;
-      try {
-        if (interruptRunning) {
-          _pending?.handleConnectionClosed(cause);
-        } else {
-          // Wait for the previous operation to complete by using the lock
-          await _operationLock.withResource(() {
-            if (!_socketIsBroken) {
-              _channel.sink.add(const TerminateMessage());
-            }
-          });
-        }
 
-        final cleanup =
-            Future.wait([_channel.sink.close(), _serverMessages.cancel()]);
-        // When the socket is broken, sink.close() may hang because socket.done
-        // never completes. Use a timeout to avoid blocking _closeSession().
-        if (_socketIsBroken) {
-          await cleanup.timeout(const Duration(seconds: 3));
-        } else {
-          await cleanup;
-        }
-      } catch (err) {
-        // error in _close(), silencing since the connection is no longer
-        // usable anyway
-      } finally {
-        _closeSession();
+    final running = _closeFuture;
+    if (running != null) {
+      // A close is already under way. Returning straight away, as this used
+      // to, tells the caller the connection is shut when it may be nothing of
+      // the kind -- and a forced close arriving on top of a polite one is
+      // precisely a caller saying the polite one has had its chance. Take the
+      // socket down for them, then report when the first close is finished.
+      if (interruptRunning) _destroySocket();
+      return running;
+    }
+
+    return _closeFuture = _runClose(interruptRunning, cause);
+  }
+
+  Future<void> _runClose(bool interruptRunning, PgException? cause) async {
+    _isClosing = true;
+    try {
+      if (interruptRunning) {
+        _pending?.handleConnectionClosed(cause);
+      } else {
+        // Wait for the previous operation to complete by using the lock
+        await _operationLock.withResource(() {
+          if (!_socketIsBroken) {
+            _channel.sink.add(const TerminateMessage());
+          }
+        }).timeout(_closeTimeout);
       }
+
+      // sink.close() may hang -- when the socket is broken because
+      // socket.done never completes, and on a loaded machine because the
+      // flush behind it does not get a turn. Bounded either way: the
+      // `finally` below is what actually guarantees the socket goes.
+      await Future.wait([
+        _channel.sink.close(),
+        _serverMessages.cancel(),
+      ]).timeout(_closeTimeout);
+    } catch (err) {
+      // error in _close(), silencing since the connection is no longer
+      // usable anyway
+    } finally {
+      // Whatever happened above, the socket must not outlive this call.
+      //
+      // The orderly path closes it as a side effect of closing the sink, so
+      // this is a no-op for a close that went to plan. It is not a no-op for
+      // one that did not: every way that path can fail -- a throw the catch
+      // above swallows, a flush that never completes -- used to leave a
+      // connected socket that nothing held a reference to, with a Postgres
+      // backend sitting `idle` behind it for as long as the process lived.
+      // Reporting success while doing that is what made the leak invisible.
+      _destroySocket();
+      _closeSession();
+    }
+  }
+
+  /// Ends the TCP session, if there is one and it has not ended already.
+  void _destroySocket() {
+    try {
+      _rawSocket?.destroy();
+    } catch (_) {
+      // Already gone. Nothing to do and nothing worth reporting: the caller
+      // asked for the socket to be shut and it is.
     }
   }
 
@@ -766,25 +843,34 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
 
   @internal
   Future<void> cancelPendingStatement() async {
-    var (channel, _) = await _connect(
+    var (channel, _, cancelSocket) = await _connect(
       _endpoint,
       _settings,
       codecContext: codecContext,
     );
-    if (_backendKeyMessage == null) {
-      throw PgException(
-        'Unable to cancel pending statement: no backend key available.',
+    try {
+      if (_backendKeyMessage == null) {
+        throw PgException(
+          'Unable to cancel pending statement: no backend key available.',
+        );
+      }
+      channel = _debugChannel(channel);
+      channel.sink.add(
+        CancelRequestMessage(
+          processId: _backendKeyMessage!.processId,
+          secretKey: _backendKeyMessage!.secretKey,
+        ),
       );
+      // Waiting for the server to close connection.
+      await channel.stream.listen((_) {}).asFuture();
+    } finally {
+      // This socket exists only to carry one cancel request, and nothing
+      // outside this method ever sees it. Bailing out before the request was
+      // sent used to leave it connected with nobody able to close it.
+      try {
+        cancelSocket.destroy();
+      } catch (_) {}
     }
-    channel = _debugChannel(channel);
-    channel.sink.add(
-      CancelRequestMessage(
-        processId: _backendKeyMessage!.processId,
-        secretKey: _backendKeyMessage!.secretKey,
-      ),
-    );
-    // Waiting for the server to close connection.
-    await channel.stream.listen((_) {}).asFuture();
   }
 }
 
