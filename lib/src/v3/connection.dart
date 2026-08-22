@@ -256,9 +256,29 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
       databaseInfo: codecContext.databaseInfo,
       info: codecContext.connectionInfo,
     );
-    await connection._startup();
-    if (connection._settings.onOpen != null) {
-      await connection._settings.onOpen!(connection);
+    // A connect that fails after the socket is up has to take the socket with
+    // it. `_startup` bounds the authentication handshake with
+    // `.timeout(connectTimeout)`, and a timeout throws without closing
+    // anything: the socket stays connected, the server finishes authenticating
+    // a moment later, and the backend sits idle for good. Nothing else can
+    // reach it -- the connection object is discarded on the way out, and it
+    // was never registered with the pool that asked for it.
+    //
+    // The same goes for an `onOpen` hook that throws, which until now also
+    // left a live connection behind for a caller that got an exception.
+    try {
+      await connection._startup();
+      if (connection._settings.onOpen != null) {
+        await connection._settings.onOpen!(connection);
+      }
+    } catch (_) {
+      try {
+        await connection.close(force: true);
+      } catch (_) {
+        // Already gone, or never fully up. The original error is the one that
+        // matters to the caller.
+      }
+      rethrow;
     }
     return connection;
   }
